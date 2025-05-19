@@ -1,3 +1,8 @@
 streamlit
-beautifulsoup4
-requests
+opencv-python
+numpy
+mediapipe
+Pillow
+rembg
+scikit-image
+google-generativeai
