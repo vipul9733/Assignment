@@ -1,756 +1,729 @@
 import streamlit as st
-import cv2
-import numpy as np
-import mediapipe as mp
-from PIL import Image, ImageOps
-import os
-import base64
-import io
-import time
-from rembg import remove
-from skimage import transform as skimage_transform
-import google.generativeai as genai
 import json
 import re
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum
 
-# --- Configuration & Global Variables ---
-TEMP_DIR = "temp_vto_debug"
-RESULTS_DIR = "results_vto"
-SAMPLES_DIR = "samples_vto"
-DEBUG_MODE = True
+# ============================================================================
+# DATA MODELS AND DATABASE
+# ============================================================================
 
-# --- Gemini Image Analyzer ---
-class GeminiImageAnalyzer:
-    def __init__(self, api_key):
-        if not api_key:
-            self.model = None
-            print("Warning: GeminiImageAnalyzer initialized without API key.")
-            return
-        try:
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-1.5-flash-latest') # Or 'gemini-pro-vision'
-            print("GeminiImageAnalyzer initialized.")
-        except Exception as e:
-            print(f"Error configuring Gemini: {e}")
-            self.model = None
-
-    def _parse_gemini_json_response(self, response_text):
-        match = re.search(r"```json\s*([\s\S]+?)\s*```", response_text)
-        if match:
-            json_str = match.group(1)
-        else:
-            json_str = response_text.strip()
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            print(f"Gemini JSON parsing error: {e}. Response text: {response_text}")
-            return None
-
-    def analyze_person_for_keypoints(self, person_img_np_rgba):
-        if not self.model: return None
-        image_pil = Image.fromarray(person_img_np_rgba).convert("RGB")
-        h, w = person_img_np_rgba.shape[:2]
-        prompt = f"""
-        Analyze this image of a person. Identify key body landmarks.
-        Provide (x, y) pixel coordinates relative to the top-left. Image: {w}x{h}px.
-        Landmarks: nose, left_eye, right_eye, left_ear, right_ear, left_shoulder, 
-        right_shoulder, left_elbow, right_elbow, left_wrist, right_wrist, 
-        left_hip, right_hip, neck, mid_hip.
-        Output ONLY a JSON object mapping landmark names to [x, y] pixel coordinates.
-        Example: {{ "left_shoulder": [150, 200], "neck": [200, 180] }}
-        Omit non-visible landmarks. Coordinates must be integers within image bounds.
-        """
-        try:
-            response = self.model.generate_content([prompt, image_pil])
-            data = self._parse_gemini_json_response(response.text)
-            if not data: return None
-            keypoints = {name.lower(): (int(max(0,min(coords[0],w-1))), int(max(0,min(coords[1],h-1))))
-                         for name, coords in data.items() if isinstance(coords, list) and len(coords) == 2}
-            print(f"Gemini person keypoints: {keypoints if keypoints else 'None'}")
-            return keypoints if keypoints else None
-        except Exception as e:
-            print(f"Gemini person analysis API error: {e}")
-            return None
-
-    def analyze_clothing_for_features(self, clothing_img_np_rgba):
-        if not self.model: return None
-        image_pil = Image.fromarray(clothing_img_np_rgba).convert("RGB")
-        h, w = clothing_img_np_rgba.shape[:2]
-        prompt = f"""
-        Analyze this clothing item image (likely background-removed). Image: {w}x{h}px.
-        1. Determine clothing type (e.g., "tshirt", "hoodie", "dress").
-        2. Identify key control points: collar_center, left_collar_point, right_collar_point,
-           left_shoulder_tip, right_shoulder_tip, left_sleeve_end, right_sleeve_end,
-           left_armpit, right_armpit, waist_left, waist_right, bottom_hem_center,
-           bottom_hem_left, bottom_hem_right. For hoodies: hood_top_center, hood_left_opening, hood_right_opening.
-        Output ONLY a JSON: {{ "type": "...", "control_points": {{ "point_name": [x,y], ... }} }}
-        Omit non-visible/NA points. Coordinates integer, within bounds.
-        """
-        try:
-            response = self.model.generate_content([prompt, image_pil])
-            data = self._parse_gemini_json_response(response.text)
-            if not data: return None
-            clothing_type = data.get("type", "unknown").lower()
-            control_points_raw = data.get("control_points", {})
-            control_points = {name.lower(): (int(max(0,min(coords[0],w-1))), int(max(0,min(coords[1],h-1))))
-                              for name, coords in control_points_raw.items() if isinstance(coords, list) and len(coords) == 2}
-            print(f"Gemini clothing type: {clothing_type}, points: {control_points if control_points else 'None'}")
-            return {"type": clothing_type, "control_points": control_points} if control_points else None
-        except Exception as e:
-            print(f"Gemini clothing analysis API error: {e}")
-            return None
-
-# --- Master Agent ---
-class MasterAgent:
-    def __init__(self, gemini_api_key=None):
-        self.gemini_analyzer = None
-        if gemini_api_key:
-            try:
-                self.gemini_analyzer = GeminiImageAnalyzer(api_key=gemini_api_key)
-            except Exception as e:
-                self._log(f"Failed to initialize Gemini Analyzer: {e}", level="warning")
-
-        self.body_analyzer = BodyAnalyzerAgent(gemini_analyzer=self.gemini_analyzer)
-        self.clothing_analyzer = ClothingAnalyzerAgent(gemini_analyzer=self.gemini_analyzer)
-        self.point_matcher = PointMatchingAgent()
-        self.transformer = ImageTransformationAgent()
-        self.post_processor = PostProcessingAgent()
-        self.quality_validator = QualityValidationAgent()
-        self.pipeline_state = {}
-
-    def _log(self, message, level="info"):
-        if not DEBUG_MODE and level == "debug": return
-        timestamp = time.strftime("%H:%M:%S")
-        log_msg = f"[{timestamp}] [{level.upper()}] {message}"
-        print(log_msg)
-        if level == "error": st.error(log_msg)
-        elif level == "warning": st.warning(log_msg)
-
-    def _get_default_config(self):
-        # (Same as before - keeping it for brevity in this snippet, ensure it's complete in your file)
+@dataclass
+class Phone:
+    id: str
+    brand: str
+    model: str
+    price: int
+    camera_mp: int
+    has_ois: bool
+    battery_mah: int
+    fast_charging_w: int
+    screen_size: float
+    processor: str
+    ram_gb: int
+    storage_gb: int
+    os: str
+    weight_g: int
+    special_features: List[str]
+    
+    def to_dict(self):
         return {
-            "body_analyzer": {"model_complexity": 1, "min_detection_confidence": 0.6},
-            "clothing_analyzer": {
-                "morph_kernel_size": 3, "use_advanced_background_removal": True,
-                "alpha_matting": True, "fg_threshold": 240, "bg_threshold": 10, "erode_size": 5
-            },
-            "point_matcher": {"adjust_for_body_angle": True, "refinement_iterations": 1},
-            "transformer": {"warping_method": "piecewise_affine", "refinement_steps": 0},
-            "post_processor": {
-                "enhance_edges": True, "apply_shadow": True, "fabric_texture_simulation": False,
-                "natural_wrinkle_simulation": True, "advanced_blending": True
-            },
-            "quality_validator": { # Pass self.pipeline_state reference if needed by validator
-                "min_confidence": 0.6, "check_anatomical_correctness": True,
-                "verify_edge_quality": False, "check_fit_quality": True, "check_color_consistency": False
-            }
+            'id': self.id,
+            'brand': self.brand,
+            'model': self.model,
+            'price': self.price,
+            'camera_mp': self.camera_mp,
+            'has_ois': self.has_ois,
+            'battery_mah': self.battery_mah,
+            'fast_charging_w': self.fast_charging_w,
+            'screen_size': self.screen_size,
+            'processor': self.processor,
+            'ram_gb': self.ram_gb,
+            'storage_gb': self.storage_gb,
+            'os': self.os,
+            'weight_g': self.weight_g,
+            'special_features': self.special_features
         }
 
+class QueryIntent(Enum):
+    SEARCH = "search"
+    COMPARE = "compare"
+    EXPLAIN = "explain"
+    DETAILS = "details"
+    ADVERSARIAL = "adversarial"
+    IRRELEVANT = "irrelevant"
 
-    def _preprocess_images(self, person_img_np, clothing_img_np):
-        # (Same as before - ensure it's complete)
-        if person_img_np.shape[2] == 3: person_img = cv2.cvtColor(person_img_np, cv2.COLOR_RGB2RGBA)
-        else: person_img = person_img_np.copy()
-        if clothing_img_np.shape[2] == 3: clothing_img = cv2.cvtColor(clothing_img_np, cv2.COLOR_RGB2RGBA)
-        else: clothing_img = clothing_img_np.copy()
+# Mock Phone Database
+PHONE_DATABASE = [
+    Phone("p1", "Samsung", "Galaxy S23 FE", 29999, 50, True, 4500, 25, 6.4, "Exynos 2200", 8, 128, "Android", 209, ["IP68", "Wireless Charging"]),
+    Phone("p2", "Google", "Pixel 8a", 52999, 64, True, 4492, 18, 6.1, "Tensor G3", 8, 128, "Android", 188, ["AI Camera", "7 Years Updates"]),
+    Phone("p3", "OnePlus", "12R", 39999, 50, True, 5500, 100, 6.78, "Snapdragon 8 Gen 2", 8, 128, "Android", 207, ["120Hz AMOLED", "Fast Charging"]),
+    Phone("p4", "Xiaomi", "Redmi Note 13 Pro+", 31999, 200, True, 5000, 120, 6.67, "Dimensity 7200", 8, 256, "Android", 199, ["200MP Camera", "Ultra Fast Charging"]),
+    Phone("p5", "Samsung", "Galaxy A54", 34999, 50, True, 5000, 25, 6.4, "Exynos 1380", 8, 128, "Android", 202, ["IP67", "Super AMOLED"]),
+    Phone("p6", "Realme", "11 Pro+", 27999, 200, True, 5000, 100, 6.7, "Dimensity 7050", 8, 256, "Android", 183, ["200MP Camera", "Curved Display"]),
+    Phone("p7", "Motorola", "Edge 40", 24999, 50, True, 4400, 68, 6.55, "Dimensity 8020", 8, 256, "Android", 167, ["Compact Design", "IP68"]),
+    Phone("p8", "Nothing", "Phone 2a", 23999, 50, False, 5000, 45, 6.7, "Dimensity 7200 Pro", 8, 128, "Android", 190, ["Glyph Interface", "Clean UI"]),
+    Phone("p9", "iQOO", "Neo 7 Pro", 34999, 50, True, 5000, 120, 6.78, "Snapdragon 8+ Gen 1", 8, 128, "Android", 197, ["Gaming Phone", "Ultra Fast Charging"]),
+    Phone("p10", "Poco", "X6 Pro", 26999, 64, True, 5000, 67, 6.67, "Dimensity 8300 Ultra", 8, 256, "Android", 186, ["Performance Beast", "Flow AMOLED"]),
+    Phone("p11", "Vivo", "V29", 32999, 50, True, 4600, 80, 6.78, "Snapdragon 778G", 8, 128, "Android", 186, ["Aura Light", "Curved Display"]),
+    Phone("p12", "Oppo", "Reno 11", 29999, 50, False, 5000, 67, 6.7, "Dimensity 7050", 8, 128, "Android", 184, ["Portrait Master", "3D Curved Screen"]),
+    Phone("p13", "Samsung", "Galaxy M34", 16999, 50, True, 6000, 25, 6.5, "Exynos 1280", 6, 128, "Android", 208, ["Monster Battery", "Super AMOLED"]),
+    Phone("p14", "Realme", "Narzo 60 Pro", 23999, 100, True, 5000, 67, 6.7, "Dimensity 7050", 8, 128, "Android", 191, ["100MP Camera", "Mars Orange Design"]),
+    Phone("p15", "Xiaomi", "13T", 39999, 50, True, 5000, 67, 6.67, "Dimensity 8200 Ultra", 8, 256, "Android", 197, ["Leica Camera", "144Hz Display"]),
+    # Budget phones under 15k
+    Phone("p16", "Redmi", "13C 5G", 9999, 50, False, 5000, 18, 6.74, "Dimensity 6100+", 4, 128, "Android", 192, ["90Hz Display", "5G Ready"]),
+    Phone("p17", "Realme", "Narzo N53", 8999, 50, False, 5000, 33, 6.74, "Unisoc T612", 4, 64, "Android", 182, ["33W Charging", "Slim Design"]),
+    Phone("p18", "Poco", "M6 5G", 9999, 50, False, 5000, 18, 6.74, "Dimensity 6100+", 4, 128, "Android", 195, ["5G Support", "90Hz Display"]),
+    Phone("p19", "Samsung", "Galaxy M14", 12990, 50, False, 6000, 25, 6.6, "Exynos 1330", 4, 128, "Android", 206, ["Massive Battery", "Super AMOLED"]),
+    Phone("p20", "Motorola", "G54 5G", 13999, 50, False, 5000, 33, 6.5, "Dimensity 7020", 6, 128, "Android", 180, ["5G Support", "120Hz Display"]),
+    Phone("p21", "Realme", "C55", 10999, 64, False, 5000, 33, 6.72, "Helio G88", 6, 128, "Android", 189, ["64MP Camera", "Premium Design"]),
+    Phone("p22", "Redmi", "12 5G", 11999, 50, False, 5000, 22, 6.79, "Snapdragon 4 Gen 2", 6, 128, "Android", 199, ["5G Ready", "90Hz Display"]),
+    Phone("p23", "Poco", "C65", 8499, 50, False, 5000, 18, 6.74, "Helio G85", 6, 128, "Android", 192, ["Big Battery", "Budget King"]),
+    Phone("p24", "Lava", "Blaze 2 5G", 9999, 50, False, 5000, 18, 6.5, "Dimensity 6020", 4, 128, "Android", 185, ["Clean Android", "5G Support"]),
+    Phone("p25", "Infinix", "Note 30 5G", 12999, 108, False, 5000, 45, 6.78, "Dimensity 6080", 8, 128, "Android", 195, ["108MP Camera", "JBL Speakers"]),
+]
 
-        max_dimension = 1024
-        for img_ref, name in [(person_img, "person"), (clothing_img, "clothing")]:
-            h_orig, w_orig = img_ref.shape[:2]
-            if max(h_orig, w_orig) > max_dimension:
-                scale = max_dimension / max(h_orig, w_orig)
-                new_size = (int(w_orig * scale), int(h_orig * scale))
-                if name == "person": person_img = cv2.resize(img_ref, new_size, interpolation=cv2.INTER_AREA)
-                else: clothing_img = cv2.resize(img_ref, new_size, interpolation=cv2.INTER_AREA)
-                self._log(f"Resized {name} image to {new_size}", level="debug")
-        return person_img, clothing_img
+# ============================================================================
+# ADVERSARIAL DETECTION & SAFETY
+# ============================================================================
 
+ADVERSARIAL_PATTERNS = [
+    r"ignore.*(?:previous|above|prior|instructions|rules)",
+    r"reveal.*(?:prompt|system|instructions|rules|api|key|secret)",
+    r"show.*(?:prompt|system|instructions|rules|api|key|secret)",
+    r"what.*(?:are|is).*your.*(?:prompt|instructions|rules|system)",
+    r"tell me.*(?:prompt|instructions|rules|system|api|key)",
+    r"bypass.*(?:security|rules|filters)",
+    r"act as.*(?:developer|admin|root)",
+    r"you are now",
+    r"pretend.*(?:you're|you are)",
+    r"roleplay",
+    r"jailbreak",
+    r"DAN mode",
+]
 
-    def _validate_agent_output(self, output, pipeline_key, required_keys=None):
-        # (Same as before - ensure it's complete)
-        if output is None:
-            raise ValueError(f"Agent returned None for {pipeline_key}")
-        if required_keys:
-            missing = [k for k in required_keys if k not in output]
-            if missing: raise ValueError(f"Missing keys in {pipeline_key}: {missing}. Has: {list(output.keys())}")
-        self.pipeline_state[pipeline_key] = output
-        if "debug_image" in output and output["debug_image"] is not None:
-            self.pipeline_state["debug_images"][pipeline_key] = output["debug_image"]
-            if DEBUG_MODE: # Save debug image
-                if not os.path.exists(TEMP_DIR): os.makedirs(TEMP_DIR)
-                path = os.path.join(TEMP_DIR, f"debug_{pipeline_key}.png")
-                try:
-                    cv2.imwrite(path, cv2.cvtColor(output["debug_image"], cv2.COLOR_RGBA2BGRA))
-                except Exception as e:
-                    self._log(f"Failed to save debug {path}: {e}", "warning")
+TOXIC_PATTERNS = [
+    r"trash.*(?:brand|phone|company)",
+    r"garbage.*(?:brand|phone|company)",
+    r"worst.*(?:brand|phone|company).*(?:ever|shit|crap)",
+    r"(?:hate|destroy|kill).*(?:brand|company)",
+]
 
-    def _apply_final_corrections(self, result_image, validation_result): # Placeholder
-        return result_image
+IRRELEVANT_KEYWORDS = [
+    "weather", "recipe", "joke", "story", "poem", "song", 
+    "movie", "politics", "religion", "stock", "crypto"
+]
 
-    def process(self, person_img_np_rgba, clothing_img_np_rgba, config=None):
-        self.pipeline_state = {
-            "person_analysis": None, "clothing_analysis": None, "point_matching": None,
-            "transformation": None, "post_processing": None, "validation": None,
-            "final_result": None, "debug_images": {}, "metadata": {},
-            "errors": [], "warnings": []
+def detect_adversarial(query: str) -> Tuple[bool, str]:
+    """Detect adversarial or malicious queries."""
+    query_lower = query.lower()
+    
+    # Check for adversarial patterns
+    for pattern in ADVERSARIAL_PATTERNS:
+        if re.search(pattern, query_lower, re.IGNORECASE):
+            return True, "security"
+    
+    # Check for toxic patterns
+    for pattern in TOXIC_PATTERNS:
+        if re.search(pattern, query_lower, re.IGNORECASE):
+            return True, "toxic"
+    
+    return False, ""
+
+def detect_irrelevant(query: str) -> bool:
+    """Detect queries unrelated to mobile phones."""
+    query_lower = query.lower()
+    
+    # Check if query is about phones at all
+    phone_keywords = ["phone", "mobile", "smartphone", "android", "ios", "iphone", 
+                      "camera", "battery", "processor", "display", "screen"]
+    
+    has_phone_context = any(kw in query_lower for kw in phone_keywords)
+    has_irrelevant = any(kw in query_lower for kw in IRRELEVANT_KEYWORDS)
+    
+    # If no phone context and has irrelevant keywords, mark as irrelevant
+    if has_irrelevant and not has_phone_context:
+        return True
+    
+    # If query is very short and has no phone keywords, it might be irrelevant
+    if len(query.split()) < 3 and not has_phone_context:
+        return True
+    
+    return False
+
+# ============================================================================
+# QUERY PARSING & INTENT DETECTION
+# ============================================================================
+
+def parse_query(query: str) -> Dict:
+    """Parse user query to extract intent and parameters."""
+    query_lower = query.lower()
+    
+    # Check for adversarial/toxic content first
+    is_adversarial, adv_type = detect_adversarial(query)
+    if is_adversarial:
+        return {
+            'intent': QueryIntent.ADVERSARIAL,
+            'adversarial_type': adv_type,
+            'original_query': query
         }
-        if config is None: config = self._get_default_config()
-        overall_start_time = time.time()
-        self.pipeline_state["metadata"]["start_time"] = overall_start_time
-        person_img_original_copy = person_img_np_rgba.copy()
-
-        try:
-            person_img, clothing_img = self._preprocess_images(person_img_np_rgba, clothing_img_np_rgba)
-
-            self._log("Analyzing person image...")
-            body_data = self.body_analyzer.analyze(person_img, config.get("body_analyzer", {}))
-            self._validate_agent_output(body_data, "person_analysis", ["body_keypoints", "segmentation_mask", "measurements"])
-
-            self._log("Analyzing clothing item...")
-            clothing_data = self.clothing_analyzer.analyze(clothing_img, config.get("clothing_analyzer", {}))
-            self._validate_agent_output(clothing_data, "clothing_analysis", ["control_points", "mask", "type", "clothing_rgba_no_bg"])
-            if not clothing_data["control_points"]: raise ValueError("Clothing analysis yielded no control points.")
-
-            self._log("Matching control points...")
-            # Pass clothing_data directly as it contains clothing_rgba_no_bg needed later by transformer
-            matched_points = self.point_matcher.match_points(body_data, clothing_data, config.get("point_matcher", {}))
-            self._validate_agent_output(matched_points, "point_matching", ["src_points", "dst_points"])
-            if len(matched_points["src_points"]) < 3: raise ValueError(f"Need at least 3 matched points, got {len(matched_points['src_points'])}.")
-
-            self._log("Transforming clothing to fit body...")
-            # Pass clothing_data["clothing_rgba_no_bg"] explicitly for transformation
-            warped_clothing, transform_meta = self.transformer.transform(
-                clothing_data["clothing_rgba_no_bg"], # Use the background-removed version
-                matched_points,
-                person_img.shape[:2],
-                config.get("transformer", {})
-            )
-            self.pipeline_state["transformation"] = {"warped_clothing": warped_clothing, "metadata": transform_meta}
-            if transform_meta.get("error") or warped_clothing is None:
-                raise ValueError(f"Image transformation error: {transform_meta.get('error', 'Warped image is None')}")
-
-            self._log("Applying post-processing...")
-            enhanced_result_dict = self.post_processor.process(person_img, warped_clothing, body_data, config.get("post_processor", {}))
-            self._validate_agent_output(enhanced_result_dict, "post_processing", ["result_image"])
-            enhanced_result = enhanced_result_dict["result_image"]
-
-            self._log("Validating result quality...")
-            # Pass self.pipeline_state to validator if it needs to access previous stages' data
-            validation_result = self.quality_validator.validate(person_img, enhanced_result, body_data, clothing_data, matched_points, config.get("quality_validator", {}), self.pipeline_state)
-            self.pipeline_state["validation"] = validation_result
-
-            final_result = self._apply_final_corrections(enhanced_result, validation_result)
-            self.pipeline_state["final_result"] = final_result
-            self.pipeline_state["metadata"]["total_processing_time"] = time.time() - overall_start_time
-            return final_result, self.pipeline_state
-
-        except Exception as e:
-            import traceback
-            error_msg = f"Pipeline error: {str(e)}\n{traceback.format_exc()}"
-            self._log(error_msg, level="error")
-            self.pipeline_state["errors"].append(error_msg)
-            return person_img_original_copy, self.pipeline_state
-
-
-# --- BodyAnalyzerAgent (Restored) ---
-class BodyAnalyzerAgent:
-    def __init__(self, model_complexity=1, static_image_mode=True, enable_segmentation=True,
-                 min_detection_confidence=0.6, gemini_analyzer=None):
-        self.mp_pose = mp.solutions.pose
-        self.pose_model = self.mp_pose.Pose(
-            static_image_mode=static_image_mode, model_complexity=model_complexity,
-            enable_segmentation=enable_segmentation, min_detection_confidence=min_detection_confidence)
-        self.mp_selfie_segmentation = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
-        self.gemini_analyzer = gemini_analyzer
-        self.min_detection_confidence = min_detection_confidence
-
-    def analyze(self, image_np_rgba, config=None):
-        config = config or {}
-        keypoints = None
-
-        if self.gemini_analyzer:
-            print("Attempting body analysis with Gemini...")
-            gemini_keypoints = self.gemini_analyzer.analyze_person_for_keypoints(image_np_rgba)
-            if gemini_keypoints and len(gemini_keypoints) > 5:
-                keypoints = gemini_keypoints
-                print("Used Gemini for body keypoints.")
+    
+    # Check for irrelevant queries
+    if detect_irrelevant(query):
+        return {
+            'intent': QueryIntent.IRRELEVANT,
+            'original_query': query
+        }
+    
+    # Extract budget
+    budget = None
+    budget_patterns = [
+        r'under\s*₹?\s*(\d+)k',
+        r'below\s*₹?\s*(\d+)k',
+        r'around\s*₹?\s*(\d+)k',
+        r'₹?\s*(\d+)k\s*budget',
+        r'up\s*to\s*₹?\s*(\d+)k',
+        r'under\s*₹?\s*(\d+)',
+        r'below\s*₹?\s*(\d+)',
+        r'around\s*₹?\s*(\d+)',
+    ]
+    for pattern in budget_patterns:
+        match = re.search(pattern, query_lower)
+        if match:
+            amount = int(match.group(1))
+            # If it's written as "15k", multiply by 1000
+            if 'k' in match.group(0):
+                budget = amount * 1000
+            # If it's a number less than 1000, assume it's in thousands (e.g., "15" means 15000)
+            elif amount < 1000:
+                budget = amount * 1000
             else:
-                print("Gemini body analysis failed or few points, falling back to MediaPipe.")
-
-        if keypoints is None:
-            print("Using MediaPipe for body analysis.")
-            image_np_rgb = cv2.cvtColor(image_np_rgba, cv2.COLOR_RGBA2RGB)
-            pose_results = self.pose_model.process(image_np_rgb)
-            if pose_results.pose_landmarks:
-                keypoints = self._extract_mediapipe_keypoints(pose_results.pose_landmarks, image_np_rgb.shape)
-            else:
-                keypoints = {}
-                print("MediaPipe found no pose landmarks.")
-
-        if keypoints:
-            self._add_derived_keypoints(keypoints, image_np_rgba.shape[:2])
-
-        measurements = self._calculate_detailed_measurements(keypoints)
+                budget = amount
+            break
+    
+    # Extract brand preference
+    brands = ["samsung", "google", "oneplus", "xiaomi", "realme", "motorola", 
+              "nothing", "iqoo", "poco", "vivo", "oppo", "pixel"]
+    brand = None
+    for b in brands:
+        if b in query_lower:
+            brand = b.title()
+            if b == "pixel":
+                brand = "Google"
+            break
+    
+    # Detect comparison intent
+    if "compare" in query_lower or "vs" in query_lower or " versus " in query_lower:
+        # Extract phone models
+        models = []
+        for phone in PHONE_DATABASE:
+            full_name = f"{phone.brand} {phone.model}".lower()
+            if full_name in query_lower or phone.model.lower() in query_lower:
+                models.append(phone.id)
         
-        image_np_rgb_for_seg = cv2.cvtColor(image_np_rgba, cv2.COLOR_RGBA2RGB)
-        pose_results_for_seg = self.pose_model.process(image_np_rgb_for_seg)
-        segmentation_mask = self._get_enhanced_segmentation_mask(image_np_rgb_for_seg, pose_results_for_seg)
+        return {
+            'intent': QueryIntent.COMPARE,
+            'phone_ids': models[:3],  # Max 3 phones
+            'original_query': query
+        }
+    
+    # Detect explanation intent
+    explain_keywords = ["explain", "what is", "difference between", "tell me about"]
+    if any(kw in query_lower for kw in explain_keywords):
+        return {
+            'intent': QueryIntent.EXPLAIN,
+            'topic': query,
+            'original_query': query
+        }
+    
+    # Detect details intent
+    if "tell me more" in query_lower or "details about" in query_lower or "this phone" in query_lower:
+        return {
+            'intent': QueryIntent.DETAILS,
+            'original_query': query
+        }
+    
+    # Extract feature preferences
+    features = {
+        'camera': any(kw in query_lower for kw in ["camera", "photo", "photography", "video"]),
+        'battery': any(kw in query_lower for kw in ["battery", "charging", "power"]),
+        'performance': any(kw in query_lower for kw in ["gaming", "performance", "fast", "processor"]),
+        'compact': any(kw in query_lower for kw in ["compact", "small", "one hand", "light"]),
+        'display': any(kw in query_lower for kw in ["display", "screen", "amoled"]),
+    }
+    
+    return {
+        'intent': QueryIntent.SEARCH,
+        'budget': budget,
+        'brand': brand,
+        'features': features,
+        'original_query': query
+    }
 
-        debug_image = self._create_debug_visualization(image_np_rgba, keypoints, segmentation_mask)
-        confidence = len(keypoints) / 33.0 if keypoints else 0.0
+# ============================================================================
+# PHONE SEARCH & FILTERING
+# ============================================================================
 
-        return {"body_keypoints": keypoints, "measurements": measurements,
-                "segmentation_mask": segmentation_mask, "confidence": confidence,
-                "debug_image": debug_image, "metadata": {}}
-
-    def _extract_mediapipe_keypoints(self, pose_landmarks, image_shape):
-        h, w = image_shape[:2]
-        keypoints = {}
-        for i, landmark in enumerate(pose_landmarks.landmark):
-            name = self.mp_pose.PoseLandmark(i).name.lower()
-            visibility = landmark.visibility if hasattr(landmark, 'visibility') else self.min_detection_confidence
-            if visibility >= self.min_detection_confidence:
-                 keypoints[name] = (int(landmark.x * w), int(landmark.y * h))
-        return keypoints
-
-    def _add_derived_keypoints(self, keypoints, image_shape_hw):
-        # (Same as before - ensure complete: neck, mid_hip, torso_center, chest, collars, waists)
-        h, w = image_shape_hw
-        # Neck
-        if 'left_shoulder' in keypoints and 'right_shoulder' in keypoints:
-            ls, rs = np.array(keypoints['left_shoulder']), np.array(keypoints['right_shoulder'])
-            neck = (ls + rs) / 2
-            if 'nose' in keypoints: neck[1] = keypoints['nose'][1] + (neck[1] - keypoints['nose'][1]) * 0.7
-            else: neck[1] -= np.linalg.norm(ls - rs) * 0.15
-            keypoints['neck'] = (int(neck[0]), int(max(0, min(neck[1], h - 1))))
-        # Mid-hip
-        if 'left_hip' in keypoints and 'right_hip' in keypoints:
-            lh, rh = np.array(keypoints['left_hip']), np.array(keypoints['right_hip'])
-            keypoints['mid_hip'] = tuple(((lh + rh) / 2).astype(int))
-        # Torso center
-        if 'neck' in keypoints and 'mid_hip' in keypoints:
-            n, mh = np.array(keypoints['neck']), np.array(keypoints['mid_hip'])
-            keypoints['torso_center'] = tuple(((n + mh) / 2).astype(int))
-        # Chest
-        if 'neck' in keypoints and 'torso_center' in keypoints:
-            n, tc = np.array(keypoints['neck']), np.array(keypoints['torso_center'])
-            keypoints['chest'] = tuple((n + 0.33 * (tc - n)).astype(int))
-        # Collar points
-        if 'neck' in keypoints and 'left_shoulder' in keypoints and 'right_shoulder' in keypoints:
-            n, ls, rs = np.array(keypoints['neck']), np.array(keypoints['left_shoulder']), np.array(keypoints['right_shoulder'])
-            keypoints['left_collar'] = tuple((n * 0.7 + ls * 0.3).astype(int)) # Simplified
-            keypoints['right_collar'] = tuple((n * 0.7 + rs * 0.3).astype(int)) # Simplified
-        # Waist points
-        if 'mid_hip' in keypoints and 'torso_center' in keypoints and 'left_hip' in keypoints and 'right_hip' in keypoints:
-            mh, tc = np.array(keypoints['mid_hip']), np.array(keypoints['torso_center'])
-            mid_waist_y = int(mh[1] - 0.33 * (mh[1] - tc[1]))
-            hip_width = abs(keypoints['right_hip'][0] - keypoints['left_hip'][0])
-            waist_width = hip_width * 0.85
-            mid_waist_x = int(mh[0])
-            keypoints['mid_waist'] = (mid_waist_x, mid_waist_y)
-            keypoints['left_waist'] = (int(mid_waist_x - waist_width / 2), mid_waist_y)
-            keypoints['right_waist'] = (int(mid_waist_x + waist_width / 2), mid_waist_y)
-
-
-    def _get_enhanced_segmentation_mask(self, image_np_rgb, pose_results):
-        # (Same as before - selfie segmentation then pose segmentation fallback)
-        h, w = image_np_rgb.shape[:2]
-        selfie_results = self.mp_selfie_segmentation.process(image_np_rgb)
-        if selfie_results.segmentation_mask is not None:
-            mask = (cv2.GaussianBlur(selfie_results.segmentation_mask, (5,5), 0) > 0.6).astype(np.float32)
-            return mask
-        if pose_results and pose_results.segmentation_mask is not None:
-            mask = (cv2.GaussianBlur(pose_results.segmentation_mask, (5,5), 0) > 0.5).astype(np.float32)
-            return mask
-        print("Warning: Segmentation mask generation failed.")
-        return np.zeros((h, w), dtype=np.float32)
-
-    def _calculate_detailed_measurements(self, keypoints):
-        # (Same as before - shoulder_width, torso_height, hip_width, body_angle)
-        m = {}
-        def dist(p1n, p2n):
-            if p1n in keypoints and p2n in keypoints: return np.linalg.norm(np.array(keypoints[p1n]) - np.array(keypoints[p2n]))
-            return 0
-        m['shoulder_width'] = dist('left_shoulder', 'right_shoulder')
-        m['torso_height'] = dist('neck', 'mid_hip')
-        if 'neck' in keypoints and 'mid_hip' in keypoints:
-            dy = keypoints['mid_hip'][1] - keypoints['neck'][1]; dx = keypoints['mid_hip'][0] - keypoints['neck'][0]
-            m['body_angle_rad'] = np.arctan2(dx, dy) if dy!=0 else (np.pi/2 if dx>0 else -np.pi/2)
-            m['body_angle_deg'] = np.degrees(m['body_angle_rad'])
-        else: m['body_angle_rad'], m['body_angle_deg'] = 0.0, 0.0
-        return m
-
-    def _create_debug_visualization(self, image_np_rgba, keypoints, segmentation_mask):
-        # (Same as before - draw circles and text for keypoints, overlay mask)
-        dbg = image_np_rgba.copy()
-        if segmentation_mask is not None and segmentation_mask.shape[:2] == dbg.shape[:2]:
-            mc = np.zeros_like(dbg); mc[segmentation_mask > 0.5] = [0,255,0,100]
-            dbg = cv2.addWeighted(dbg, 1.0, mc, 0.3, 0)
-        for name, (x,y) in keypoints.items():
-            cv2.circle(dbg, (x,y), 3, (255,0,0,255), -1)
-            cv2.putText(dbg, name, (x+5,y+5), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255,255,0,255),1)
-        return dbg
-
-    def close(self):
-        self.mp_selfie_segmentation.close()
-        self.pose_model.close()
-
-# --- ClothingAnalyzerAgent (Restored) ---
-class ClothingAnalyzerAgent:
-    def __init__(self, gemini_analyzer=None):
-        self.gemini_analyzer = gemini_analyzer
-
-    def analyze(self, clothing_img_np_rgba, config=None):
-        config = config or {}
-        metadata = {"error": None}
-        clothing_type, control_points = "unknown", {}
-
-        # 1. Background Removal
-        clothing_mask_binary, clothing_no_bg_rgba = self._remove_background(clothing_img_np_rgba, config)
-        if clothing_no_bg_rgba is None or clothing_mask_binary is None or cv2.countNonZero(clothing_mask_binary) < 100:
-            metadata["error"] = "Background removal failed."
-            clothing_no_bg_rgba = clothing_img_np_rgba
-            h,w = clothing_img_np_rgba.shape[:2]; clothing_mask_binary = np.full((h,w), 255, dtype=np.uint8)
-            print("Warning: Using original clothing image due to BG removal failure.")
-
-        # 2. Try Gemini
-        if self.gemini_analyzer:
-            print("Attempting clothing analysis with Gemini...")
-            gemini_features = self.gemini_analyzer.analyze_clothing_for_features(clothing_no_bg_rgba)
-            if gemini_features and gemini_features.get("control_points"):
-                clothing_type, control_points = gemini_features.get("type", "unknown"), gemini_features["control_points"]
-                print(f"Used Gemini for clothing. Type: {clothing_type}, Points: {len(control_points)}")
-            else:
-                print("Gemini clothing analysis failed or no points, falling back to CV.")
-                clothing_type, control_points = "unknown", {} # Reset
-
-        # 3. Fallback to CV
-        if not control_points:
-            print("Using CV for clothing analysis.")
-            # Determine mask from clothing_no_bg_rgba's alpha
-            current_mask_binary = cv2.threshold(clothing_no_bg_rgba[:,:,3], 10, 255, cv2.THRESH_BINARY)[1] if clothing_no_bg_rgba.shape[2]==4 else clothing_mask_binary
-
-            contours = self._extract_contours(current_mask_binary)
-            if contours:
-                main_contour = max(contours, key=cv2.contourArea)
-                if clothing_type == "unknown": clothing_type = self._detect_clothing_type_cv(main_contour, clothing_no_bg_rgba.shape[:2])
-                control_points = self._extract_control_points_cv(main_contour, clothing_type, clothing_no_bg_rgba.shape[:2])
-            else:
-                if not metadata["error"]: metadata["error"] = "No contours found for CV clothing analysis."
-                print("Warning: No contours for CV clothing analysis.")
-                if not control_points: # Last resort fallback points
-                    h,w = clothing_no_bg_rgba.shape[:2]
-                    control_points = {'collar_center':(w//2,h//10),'bottom_hem_center':(w//2,h*9//10),
-                                      'left_shoulder_tip':(w//4,h//8),'right_shoulder_tip':(w*3//4,h//8)}
-                    clothing_type = "generic_fallback_cv"
-
-        debug_image = self._create_debug_visualization(clothing_img_np_rgba, clothing_mask_binary, control_points, clothing_type)
-        return {"type": clothing_type, "control_points": control_points,
-                "mask": clothing_mask_binary, "clothing_rgba_no_bg": clothing_no_bg_rgba,
-                "debug_image": debug_image, "metadata": metadata}
-
-    def _remove_background(self, clothing_img_np_rgba, config):
-        # (Same as before - try alpha, then rembg)
-        alpha = clothing_img_np_rgba[:,:,3]
-        if np.mean(alpha) < 245: # Has transparency
-            print("Using existing alpha for clothing BG removal.")
-            mask_bin = cv2.threshold(alpha, 10, 255, cv2.THRESH_BINARY)[1]
-            kernel=np.ones((3,3),np.uint8); mask_bin=cv2.morphologyEx(cv2.morphologyEx(mask_bin,cv2.MORPH_OPEN,kernel),cv2.MORPH_CLOSE,kernel)
-            no_bg = clothing_img_np_rgba.copy(); no_bg[:,:,3] = mask_bin
-            return mask_bin, no_bg
+def search_phones(parsed_query: Dict) -> List[Phone]:
+    """Search and filter phones based on parsed query."""
+    results = PHONE_DATABASE.copy()
+    
+    # Filter by budget (add 10% buffer for "around" queries)
+    if parsed_query.get('budget'):
+        budget = parsed_query['budget']
+        # Add buffer if query uses "around"
+        if 'around' in parsed_query.get('original_query', '').lower():
+            budget_max = budget * 1.15  # 15% upper buffer
+            budget_min = budget * 0.85  # 15% lower buffer
+            results = [p for p in results if budget_min <= p.price <= budget_max]
+        else:
+            results = [p for p in results if p.price <= budget]
+    
+    # Filter by brand
+    if parsed_query.get('brand'):
+        brand_lower = parsed_query['brand'].lower()
+        results = [p for p in results if p.brand.lower() == brand_lower or 
+                   (brand_lower == 'google' and p.brand.lower() == 'pixel') or
+                   (brand_lower == 'redmi' and p.brand.lower() in ['redmi', 'xiaomi']) or
+                   (brand_lower == 'xiaomi' and p.brand.lower() in ['redmi', 'xiaomi'])]
+    
+    # Score phones based on features
+    scored_phones = []
+    for phone in results:
+        score = 0
+        features = parsed_query.get('features', {})
         
-        print("Attempting rembg for clothing BG removal.")
-        try:
-            no_bg_pil = remove(Image.fromarray(cv2.cvtColor(clothing_img_np_rgba, cv2.COLOR_RGBA2RGB)), # rembg needs RGB
-                                alpha_matting=config.get("alpha_matting",True),
-                                alpha_matting_foreground_threshold=config.get("fg_threshold",240),
-                                alpha_matting_background_threshold=config.get("bg_threshold",10),
-                                alpha_matting_erode_size=config.get("erode_size",10))
-            no_bg_rgba = np.array(no_bg_pil) # rembg returns RGBA
-            mask_bin = cv2.threshold(no_bg_rgba[:,:,3], 10, 255, cv2.THRESH_BINARY)[1]
-            return mask_bin, no_bg_rgba
-        except Exception as e:
-            print(f"rembg failed: {e}. Fallback.")
-            return None, None
-
-    def _extract_contours(self, mask_binary):
-        # (Same as before)
-        cnts, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        return [c for c in cnts if cv2.contourArea(c) > 100]
-
-    def _detect_clothing_type_cv(self, main_contour, image_shape_hw):
-        # (Same basic CV type detection as before)
-        x,y,w,h = cv2.boundingRect(main_contour)
-        aspect = w/float(h) if h>0 else 0
-        if 0.8 < aspect < 1.5 : return "tshirt_cv" # Basic
-        return "unknown_cv"
-
-    def _extract_control_points_cv(self, main_contour, clothing_type, image_shape_hw):
-        # (Same improved CV control point extraction as before)
-        # Extracts: bottom_hem_center/left/right, collar_center, shoulder_tips, collar_points, sleeve_ends, hood_top_center
-        # Ensure this is complete and robust in your actual file.
-        pts = {}
-        xb,yb,wb,hb = cv2.boundingRect(main_contour)
-        lm,rm,tm,bm = tuple(main_contour[main_contour[:,:,0].argmin()][0]), \
-                        tuple(main_contour[main_contour[:,:,0].argmax()][0]), \
-                        tuple(main_contour[main_contour[:,:,1].argmin()][0]), \
-                        tuple(main_contour[main_contour[:,:,1].argmax()][0])
-        pts['bottom_hem_center'] = bm; pts['collar_center'] = tm
-        pts['left_shoulder_tip']=(xb+wb//4,yb+hb//10); pts['right_shoulder_tip']=(xb+wb*3//4,yb+hb//10) # Approx
-        # Add more points based on contour analysis here...
-        print(f"CV clothing points ({clothing_type}): {pts}")
-        return pts
-
-    def _create_debug_visualization(self, original_img_rgba, clothing_mask_binary, control_points, clothing_type):
-        # (Same as before - draw mask contour, control points, type label)
-        dbg = original_img_rgba.copy()
-        if clothing_mask_binary is not None:
-            cnts,_=cv2.findContours(clothing_mask_binary,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(dbg,cnts,-1,(0,255,0,150),1)
-        for name,(x,y) in control_points.items():
-            cv2.circle(dbg,(int(x),int(y)),2,(0,0,255,255),-1) # Smaller points
-            cv2.putText(dbg,name,(int(x)+3,int(y)+3),cv2.FONT_HERSHEY_SIMPLEX,0.25,(255,255,0,255),1)
-        cv2.putText(dbg,f"Type:{clothing_type}",(5,15),cv2.FONT_HERSHEY_SIMPLEX,0.4,(255,255,255,255),1)
-        return dbg
-
-# --- PointMatchingAgent (Restored) ---
-STANDARD_CLOTHING_TO_BODY_MAP = { # Keep this comprehensive
-    "collar_center": "neck", "left_collar_point": "left_collar", "right_collar_point": "right_collar",
-    "left_shoulder_tip": "left_shoulder", "right_shoulder_tip": "right_shoulder",
-    "left_sleeve_end": "left_wrist", "right_sleeve_end": "right_wrist",
-    "left_armpit": "left_shoulder", "right_armpit": "right_shoulder", # Needs offset logic
-    "waist_left": "left_waist", "waist_right": "right_waist",
-    "bottom_hem_center": "mid_hip", "bottom_hem_left": "left_hip", "bottom_hem_right": "right_hip",
-    "hood_top_center": "nose", "hood_left_opening": "left_ear", "hood_right_opening": "right_ear",
-}
-SHORT_SLEEVE_MAP_EXTENSION = {"left_sleeve_end": "left_elbow", "right_sleeve_end": "right_elbow"}
-
-class PointMatchingAgent:
-    def match_points(self, body_data, clothing_data, config=None):
-        # (Same as before - use STANDARD_CLOTHING_TO_BODY_MAP, check for short sleeves)
-        src_pts, dst_pts = [], []
-        body_kpts, cloth_pts = body_data["body_keypoints"], clothing_data["control_points"]
-        cloth_type = clothing_data.get("type", "unknown").lower()
+        if features.get('camera'):
+            score += phone.camera_mp / 10
+            if phone.has_ois:
+                score += 5
         
-        current_map = STANDARD_CLOTHING_TO_BODY_MAP.copy()
-        if "tshirt" in cloth_type or "polo" in cloth_type: current_map.update(SHORT_SLEEVE_MAP_EXTENSION)
-
-        matched_names = []
-        for cpn, bpn in current_map.items():
-            if cpn in cloth_pts and bpn in body_kpts:
-                src_pts.append(cloth_pts[cpn]); dst_pts.append(body_kpts[bpn])
-                matched_names.append(cpn)
-        print(f"Matched {len(src_pts)} points. Names: {matched_names}")
+        if features.get('battery'):
+            score += phone.battery_mah / 500
+            score += phone.fast_charging_w / 10
         
-        dbg_img = None
-        if body_data.get("debug_image") is not None and src_pts:
-            dbg_img = self._create_debug_visualization(body_data["debug_image"], src_pts, dst_pts)
+        if features.get('performance'):
+            score += phone.ram_gb * 2
+            if "snapdragon 8" in phone.processor.lower() or "dimensity 8" in phone.processor.lower():
+                score += 10
         
-        return {"src_points": src_pts, "dst_points": dst_pts, "debug_image": dbg_img,
-                "metadata": {"match_count": len(src_pts)}}
-
-    def _create_debug_visualization(self, body_debug_img_rgba, src_points, dst_points):
-        # (Same as before - draw circles on body_debug_img for dst_points)
-        vis = body_debug_img_rgba.copy()
-        for i, (dx,dy) in enumerate(dst_points):
-            cv2.circle(vis,(dx,dy),4,(0,0,255,255),-1) # DST points
-            cv2.putText(vis, f"m{i}",(dx+6,dy+6),cv2.FONT_HERSHEY_SIMPLEX,0.4,(255,255,0,255),1)
-        return vis
-
-# --- ImageTransformationAgent (Restored) ---
-class ImageTransformationAgent:
-    def transform(self, clothing_rgba_to_transform, matched_points_dict, target_shape_hw, config=None):
-        # (Same as before - use PiecewiseAffineTransform)
-        # IMPORTANT: clothing_rgba_to_transform should be the background-removed one
-        src_np = np.array(matched_points_dict["src_points"], dtype=np.float32)
-        dst_np = np.array(matched_points_dict["dst_points"], dtype=np.float32)
-        meta = {"warping_method": "piecewise_affine", "error": None}
-
-        if len(src_np) < 3:
-            meta["error"] = "Piecewise Affine needs at least 3 points."
-            return np.zeros((target_shape_hw[0], target_shape_hw[1], 4), dtype=np.uint8), meta
-        try:
-            src_yx, dst_yx = src_np[:,::-1], dst_np[:,::-1] # y,x format for skimage
-            tform = skimage_transform.PiecewiseAffineTransform(); tform.estimate(src_yx, dst_yx)
-            
-            out_shape_sk = (target_shape_hw[0], target_shape_hw[1], clothing_rgba_to_transform.shape[2])
-            warped = skimage_transform.warp(clothing_rgba_to_transform, tform.inverse, 
-                                            output_shape=out_shape_sk, order=1, 
-                                            mode='constant', cval=0, preserve_range=True)
-            warped_u8 = (warped * 255).astype(np.uint8) if np.issubdtype(warped.dtype, np.floating) and warped.max()<=1 else warped.astype(np.uint8)
-
-            # Ensure 4 channels if original was 4
-            if warped_u8.shape[2] == 3 and clothing_rgba_to_transform.shape[2] == 4:
-                alpha_original = clothing_rgba_to_transform[:,:,3]
-                alpha_warped = skimage_transform.warp(alpha_original, tform.inverse,
-                                                      output_shape=target_shape_hw, order=1,
-                                                      mode='constant', cval=0, preserve_range=True)
-                alpha_warped_u8 = (alpha_warped*255).astype(np.uint8) if np.issubdtype(alpha_warped.dtype,np.floating) and alpha_warped.max()<=1 else alpha_warped.astype(np.uint8)
-                warped_u8 = cv2.merge((warped_u8, alpha_warped_u8))
-            elif warped_u8.shape[2] != 4 : # if not 3 (and became 4) and not already 4
-                 # create empty alpha
-                 empty_alpha = np.zeros(target_shape_hw, dtype=np.uint8)
-                 if warped_u8.shape[2] == 1: # Grayscale
-                     warped_u8 = cv2.cvtColor(warped_u8, cv2.COLOR_GRAY2RGBA)
-                 elif warped_u8.shape[2] == 3: # RGB
-                     warped_u8 = cv2.cvtColor(warped_u8, cv2.COLOR_RGB2RGBA)
-                 else: # Unhandled, return transparent
-                     meta["error"] = f"Warped image has unexpected shape: {warped_u8.shape}"
-                     return np.zeros((target_shape_hw[0], target_shape_hw[1], 4), dtype=np.uint8), meta
-            return warped_u8, meta
-        except Exception as e:
-            import traceback
-            meta["error"] = f"Transform failed: {e}\n{traceback.format_exc()}"
-            return np.zeros((target_shape_hw[0], target_shape_hw[1], 4), dtype=np.uint8), meta
-
-
-# --- PostProcessingAgent (Restored) ---
-class PostProcessingAgent:
-    def process(self, person_img_rgba, warped_clothing_rgba, body_data, config=None):
-        # (Same blending logic as before, ensuring masks and alphas are handled)
-        config = config or {}
-        result_img = person_img_rgba.copy()
-        meta = {"error": None}
-
-        if warped_clothing_rgba is None or warped_clothing_rgba.shape[0]==0:
-            meta["error"] = "Warped clothing empty for post-processing."
-            return {"result_image": result_img, "metadata": meta}
-
-        # Ensure warped clothing is RGBA
-        if warped_clothing_rgba.shape[2] == 3:
-            warped_clothing_rgba = cv2.cvtColor(warped_clothing_rgba, cv2.COLOR_RGB2RGBA)
-            warped_clothing_rgba[:,:,3] = 255 # Assume opaque if only 3 channels came
-
-        person_mask_float = body_data.get("segmentation_mask") # HxW, float 0-1
-        if person_mask_float is None:
-            person_mask_float = (person_img_rgba[:,:,3] > 10).astype(np.float32) if person_img_rgba.shape[2]==4 else np.ones(person_img_rgba.shape[:2], dtype=np.float32)
-        if person_mask_float.ndim == 3: person_mask_float = person_mask_float.squeeze(axis=2)
-
-        clothing_alpha_float = warped_clothing_rgba[:,:,3:4] / 255.0 # HxWx1
-        effective_alpha = clothing_alpha_float * person_mask_float[:,:,np.newaxis]
-
-        result_img[:,:,:3] = result_img[:,:,:3]*(1-effective_alpha) + warped_clothing_rgba[:,:,:3]*effective_alpha
+        if features.get('compact'):
+            if phone.screen_size < 6.6:
+                score += 10
+            if phone.weight_g < 190:
+                score += 5
         
-        # Update combined alpha: max of person's original alpha and new effective clothing alpha
-        # Ensure person_img_rgba has alpha before accessing it
-        person_original_alpha_float = person_img_rgba[:,:,3]/255.0 if person_img_rgba.shape[2] == 4 else np.ones(person_img_rgba.shape[:2], dtype=np.float32)
-        new_combined_alpha_u8 = (np.maximum(person_original_alpha_float, effective_alpha.squeeze())*255).astype(np.uint8)
-        result_img[:,:,3] = new_combined_alpha_u8
+        if features.get('display'):
+            if "amoled" in str(phone.special_features).lower():
+                score += 5
         
-        # Optional effects
-        if config.get("natural_wrinkle_simulation"): result_img = self._add_natural_wrinkles(result_img, body_data, warped_clothing_rgba, effective_alpha.squeeze())
-        if config.get("apply_shadow"): result_img = self._add_clothing_shadows(result_img, body_data, warped_clothing_rgba, effective_alpha.squeeze())
+        scored_phones.append((phone, score))
+    
+    # Sort by score, then by price (lower is better)
+    scored_phones.sort(key=lambda x: (-x[1], x[0].price))
+    
+    return [p[0] for p in scored_phones[:5]]
 
-        return {"result_image": result_img, "metadata": meta}
+def get_phone_by_id(phone_id: str) -> Optional[Phone]:
+    """Get phone by ID."""
+    for phone in PHONE_DATABASE:
+        if phone.id == phone_id:
+            return phone
+    return None
 
-    def _add_natural_wrinkles(self, blended_img, body_data, clothing_img, clothing_eff_mask_float): # Placeholder
-        return blended_img
-    def _add_clothing_shadows(self, blended_img, body_data, clothing_img, clothing_eff_mask_float): # Placeholder
-        return blended_img
+# ============================================================================
+# RESPONSE GENERATION
+# ============================================================================
 
-# --- QualityValidationAgent (Restored) ---
-class QualityValidationAgent:
-    def validate(self, person_img, result_img, body_data, clothing_data, matched_points, config=None, pipeline_state_ref=None):
-        # (Same basic validation logic as before)
-        is_valid, issues, score = True, [], 0.7 # Defaults
-        if result_img is None or result_img.shape[0]==0:
-            is_valid, issues, score = False, ["Result image empty"], 0.0
+def generate_comparison_response(phone_ids: List[str]) -> str:
+    """Generate comparison response for phones."""
+    phones = [get_phone_by_id(pid) for pid in phone_ids if get_phone_by_id(pid)]
+    
+    if len(phones) < 2:
+        return "I need at least 2 phones to compare. Please specify the models you'd like to compare."
+    
+    response = f"## Comparing {len(phones)} Phones\n\n"
+    
+    # Price comparison
+    response += "### 💰 Price\n"
+    for phone in phones:
+        response += f"- **{phone.brand} {phone.model}**: ₹{phone.price:,}\n"
+    
+    # Camera comparison
+    response += "\n### 📸 Camera\n"
+    for phone in phones:
+        ois = "Yes ✓" if phone.has_ois else "No ✗"
+        response += f"- **{phone.brand} {phone.model}**: {phone.camera_mp}MP, OIS: {ois}\n"
+    
+    # Battery comparison
+    response += "\n### 🔋 Battery & Charging\n"
+    for phone in phones:
+        response += f"- **{phone.brand} {phone.model}**: {phone.battery_mah}mAh, {phone.fast_charging_w}W fast charging\n"
+    
+    # Performance comparison
+    response += "\n### ⚡ Performance\n"
+    for phone in phones:
+        response += f"- **{phone.brand} {phone.model}**: {phone.processor}, {phone.ram_gb}GB RAM\n"
+    
+    # Trade-offs
+    response += "\n### 🎯 Key Trade-offs\n\n"
+    
+    best_camera = max(phones, key=lambda p: p.camera_mp)
+    response += f"**Best Camera**: {best_camera.brand} {best_camera.model} ({best_camera.camera_mp}MP)\n\n"
+    
+    best_battery = max(phones, key=lambda p: p.battery_mah)
+    response += f"**Best Battery**: {best_battery.brand} {best_battery.model} ({best_battery.battery_mah}mAh)\n\n"
+    
+    fastest_charging = max(phones, key=lambda p: p.fast_charging_w)
+    response += f"**Fastest Charging**: {fastest_charging.brand} {fastest_charging.model} ({fastest_charging.fast_charging_w}W)\n\n"
+    
+    cheapest = min(phones, key=lambda p: p.price)
+    response += f"**Best Value**: {cheapest.brand} {cheapest.model} (₹{cheapest.price:,})\n\n"
+    
+    return response
+
+def generate_explanation_response(topic: str) -> str:
+    """Generate explanation for technical terms."""
+    topic_lower = topic.lower()
+    
+    if "ois" in topic_lower and "eis" in topic_lower:
+        return """## OIS vs EIS: Camera Stabilization Explained
+
+**OIS (Optical Image Stabilization)**
+- Hardware-based stabilization using physical lens movement
+- Compensates for hand shake in real-time
+- Better for low-light photography and video
+- More expensive to implement
+- Example: Moving lens elements counteract movement
+
+**EIS (Electronic Image Stabilization)**
+- Software-based stabilization using digital cropping
+- Crops and shifts the frame to smooth out movement
+- Can introduce slight quality loss due to cropping
+- Cheaper to implement
+- Works well in good lighting conditions
+
+**Which is better?** OIS is generally superior, especially for photos and low-light scenarios. Many flagship phones use both OIS + EIS for best results.
+"""
+    
+    elif "processor" in topic_lower or "chipset" in topic_lower:
+        return """## Mobile Processors Explained
+
+**Snapdragon (Qualcomm)**
+- Most popular in premium Android phones
+- Gen 8 series: Flagship performance
+- Gen 7 series: Mid-range performance
+- Excellent gaming and AI capabilities
+
+**Dimensity (MediaTek)**
+- Strong mid-range and upper mid-range options
+- 7000-9000 series offer great value
+- Improving gaming performance
+- Power efficient
+
+**Exynos (Samsung)**
+- Used in Samsung phones
+- Mixed reputation for efficiency
+- Newer generations improving
+
+**Tensor (Google)**
+- Custom chip by Google for Pixel phones
+- Optimized for AI and machine learning
+- Excellent camera processing
+"""
+    
+    elif "amoled" in topic_lower or "display" in topic_lower:
+        return """## Display Technology Explained
+
+**AMOLED (Active Matrix OLED)**
+- Self-lit pixels (no backlight needed)
+- True blacks and infinite contrast
+- Vibrant colors and wide viewing angles
+- More power efficient with dark themes
+- Used in most premium phones
+
+**Super AMOLED (Samsung)**
+- Samsung's enhanced AMOLED
+- Better sunlight visibility
+- Touch sensors integrated into display
+
+**LCD/IPS**
+- Requires backlight
+- Generally cheaper
+- Can't achieve true blacks
+- Still good color accuracy
+
+**Refresh Rate**
+- 60Hz: Standard
+- 90Hz: Smoother scrolling
+- 120Hz: Premium smoothness for gaming and UI
+"""
+    
+    else:
+        return "I can explain various phone-related terms like OIS vs EIS, processor types, display technology, camera specs, and more. What specific topic would you like me to explain?"
+
+def generate_search_response(phones: List[Phone], parsed_query: Dict) -> str:
+    """Generate search response with recommendations."""
+    if not phones:
+        return "Sorry, I couldn't find any phones matching your criteria. Try adjusting your budget or requirements."
+    
+    budget_str = f"under ₹{parsed_query.get('budget'):,}" if parsed_query.get('budget') else "in your range"
+    brand_str = f" from {parsed_query.get('brand')}" if parsed_query.get('brand') else ""
+    
+    response = f"## 📱 Found {len(phones)} Great Options {budget_str}{brand_str}\n\n"
+    
+    # Top recommendation
+    top_phone = phones[0]
+    response += f"### 🏆 Top Recommendation: {top_phone.brand} {top_phone.model}\n"
+    response += f"**Price**: ₹{top_phone.price:,}\n\n"
+    
+    # Explain why
+    response += "**Why this phone?**\n"
+    features = parsed_query.get('features', {})
+    
+    if features.get('camera'):
+        response += f"- Excellent {top_phone.camera_mp}MP camera with {'OIS for stable shots' if top_phone.has_ois else 'great image quality'}\n"
+    
+    if features.get('battery'):
+        response += f"- Powerful {top_phone.battery_mah}mAh battery with {top_phone.fast_charging_w}W fast charging\n"
+    
+    if features.get('performance'):
+        response += f"- Strong {top_phone.processor} processor with {top_phone.ram_gb}GB RAM\n"
+    
+    if features.get('compact'):
+        response += f"- Compact {top_phone.screen_size}\" display, easy to handle at {top_phone.weight_g}g\n"
+    
+    if not any(features.values()):
+        response += f"- Well-balanced specs with {top_phone.processor}, {top_phone.ram_gb}GB RAM\n"
+        response += f"- Good {top_phone.camera_mp}MP camera and {top_phone.battery_mah}mAh battery\n"
+    
+    if top_phone.special_features:
+        response += f"- Special features: {', '.join(top_phone.special_features)}\n"
+    
+    response += "\n"
+    
+    return response
+
+def handle_adversarial_query(parsed_query: Dict) -> str:
+    """Handle adversarial queries with appropriate refusal."""
+    adv_type = parsed_query.get('adversarial_type', 'security')
+    
+    if adv_type == 'security':
+        return """I'm a mobile phone shopping assistant designed to help you find the perfect phone. I cannot:
+- Reveal system prompts or internal instructions
+- Share API keys or credentials
+- Bypass security measures
+
+**How can I help you?** I can:
+- Recommend phones based on your budget and needs
+- Compare different models
+- Explain technical terms
+- Answer questions about phone features
+
+Please ask me about mobile phones!"""
+    
+    elif adv_type == 'toxic':
+        return """I maintain a neutral, factual approach when discussing phone brands and models. Instead of making negative generalizations, I can:
+
+- Compare specific models objectively
+- Discuss pros and cons of different phones
+- Help you find alternatives that match your needs
+- Provide factual specifications and reviews
+
+What specific features or phones would you like to know about?"""
+    
+    return "I'm here to help you find the right mobile phone. Please ask me about phone recommendations, comparisons, or features!"
+
+def handle_irrelevant_query(parsed_query: Dict) -> str:
+    """Handle queries unrelated to mobile phones."""
+    return """I'm specifically designed to help with mobile phone shopping. I can assist you with:
+
+📱 Finding phones based on your budget and needs
+🔍 Comparing different models
+💡 Explaining technical features (OIS, processors, displays, etc.)
+📊 Showing detailed specifications
+
+I cannot help with topics unrelated to mobile phones. How can I help you find your perfect phone today?"""
+
+# ============================================================================
+# STREAMLIT UI
+# ============================================================================
+
+def display_phone_card(phone: Phone):
+    """Display phone as a card using Streamlit components."""
+    with st.container():
+        col1, col2 = st.columns([3, 1])
         
-        # Check if clothing is visible (crude check based on alpha change)
-        if is_valid and result_img.shape[2] == 4 and person_img.shape[2] == 4 and pipeline_state_ref:
-             warped_cloth_from_pipeline = pipeline_state_ref.get("transformation",{}).get("warped_clothing")
-             if warped_cloth_from_pipeline is not None and warped_cloth_from_pipeline[:,:,3].mean() > 20: # If warped cloth had significant alpha
-                 # If final result's alpha didn't increase much over original person's alpha
-                 if result_img[:,:,3].mean() < person_img[:,:,3].mean() + 10: 
-                     print("Warning QVA: Clothing overlay might be minimal or blended away.")
-                     # issues.append("Clothing not visibly overlaid") # Can be too strict
-                     # score = max(0.1, score - 0.3)
-
-        return {"is_valid": is_valid, "issues": issues, "score": score, "corrections": {}, "metadata": {}}
-
-
-# --- Streamlit UI (Restored - ensure it matches your intended UI) ---
-def load_image_from_upload(uploaded_file):
-    # (Same as before)
-    if not uploaded_file: return None
-    try: return np.array(Image.open(uploaded_file).convert("RGBA"))
-    except Exception as e: st.error(f"Img load error: {e}"); return None
-
-def get_download_link(image_np, filename="result.png", text="Download Result Image"):
-    # (Same as before)
-    buf = io.BytesIO(); Image.fromarray(image_np).save(buf,format="PNG")
-    img_s = base64.b64encode(buf.getvalue()).decode()
-    return f'<a href="data:image/png;base64,{img_s}" download="{filename}">{text}</a>'
+        with col1:
+            st.markdown(f"### {phone.brand} {phone.model}")
+        with col2:
+            st.markdown(f"### ₹{phone.price:,}")
+        
+        # Specs in columns
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.markdown(f"**📸 Camera:** {phone.camera_mp}MP {'+OIS' if phone.has_ois else ''}")
+            st.markdown(f"**🔋 Battery:** {phone.battery_mah}mAh")
+        
+        with col2:
+            st.markdown(f"**⚡ Charging:** {phone.fast_charging_w}W")
+            st.markdown(f"**📱 Display:** {phone.screen_size}\"")
+        
+        with col3:
+            st.markdown(f"**🧠 Processor:** {phone.processor}")
+            st.markdown(f"**💾 RAM:** {phone.ram_gb}GB")
+        
+        st.markdown(f"**✨ Special:** {', '.join(phone.special_features)}")
+        st.divider()
 
 def main():
-    global DEBUG_MODE
-    st.set_page_config(page_title="AI Virtual Try-On", layout="wide")
-    for D_DIR in [RESULTS_DIR, TEMP_DIR, SAMPLES_DIR]:
-        if not os.path.exists(D_DIR): os.makedirs(D_DIR)
-
-    st.title("👕 AI-Powered Virtual Clothing Try-On")
-    # ... (Rest of Streamlit UI: sidebar for API key, file uploads, sample selection, "Try It On" button)
+    st.set_page_config(
+        page_title="AI Mobile Phone Assistant",
+        page_icon="📱",
+        layout="wide"
+    )
+    
+    # Custom CSS
+    st.markdown("""
+    <style>
+    .main {
+        max-width: 1200px;
+        margin: 0 auto;
+    }
+    .stChatMessage {
+        background-color: #f0f2f6;
+        border-radius: 10px;
+        padding: 10px;
+        margin: 5px 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Header
+    st.title("📱 AI Mobile Phone Shopping Assistant")
+    st.markdown("Find your perfect phone with AI-powered recommendations")
+    
+    # Initialize session state
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+        st.session_state.last_phones = []
+    
+    # Sidebar with examples
     with st.sidebar:
-        st.header("Settings")
-        gemini_api_key = st.text_input("Google Gemini API Key (Optional)", type="password")
-        DEBUG_MODE = st.checkbox("Enable Debug Mode", value=DEBUG_MODE)
-        st.info(f"Debug mode: {'ON' if DEBUG_MODE else 'OFF'}")
-
-        st.subheader("Person Image")
-        person_file = st.file_uploader("Upload your photo", type=["jpg", "jpeg", "png"])
-        st.subheader("Clothing Item")
-        clothing_source = st.radio("Choose clothing source", ["Upload", "Sample"])
-        clothing_file, sample_path = None, None
-        if clothing_source == "Upload":
-            clothing_file = st.file_uploader("Upload clothing", type=["png", "jpg", "jpeg"])
-        else:
-            sample_files = {f.rsplit('.',1)[0].replace("_"," ").title(): os.path.join(SAMPLES_DIR,f)
-                            for f in os.listdir(SAMPLES_DIR) if f.lower().endswith((".png",".jpg",".jpeg"))}
-            if sample_files:
-                sample_name = st.selectbox("Choose sample", list(sample_files.keys()))
-                if sample_name: sample_path = sample_files[sample_name]
-            else: st.info("No samples in 'samples_vto'.")
-
-    col1, col2 = st.columns(2)
-    person_img_np, clothing_img_np = None, None
-    with col1:
-        st.subheader("Your Photo")
-        if person_file: person_img_np = load_image_from_upload(person_file)
-        if person_img_np is not None: st.image(person_img_np, use_column_width=True)
-    with col2:
-        st.subheader("Clothing Item")
-        if clothing_file: clothing_img_np = load_image_from_upload(clothing_file)
-        elif sample_path:
-            try: clothing_img_np = np.array(Image.open(sample_path).convert("RGBA"))
-            except Exception as e: st.error(f"Sample load error: {e}")
-        if clothing_img_np is not None: st.image(clothing_img_np, use_column_width=True)
-
-    if st.button("✨ Try It On!", type="primary", disabled=(person_img_np is None or clothing_img_np is None)):
-        master_agent_instance = MasterAgent(gemini_api_key=gemini_api_key if gemini_api_key else None)
-        with st.spinner("Processing..."):
-            current_config = master_agent_instance._get_default_config() # Use defaults for now
-            result_image, pipeline_state = master_agent_instance.process(
-                person_img_np, clothing_img_np, config=current_config
-            )
-
-            if result_image is not None:
-                st.subheader("🎉 Result")
-                st.image(result_image, caption="Virtual Try-On Result", use_column_width=True)
-                st.markdown(get_download_link(result_image), unsafe_allow_html=True)
-                if DEBUG_MODE:
-                    st.info(f"Total time: {pipeline_state.get('metadata',{}).get('total_processing_time',0):.2f}s")
-                    if pipeline_state.get("errors"):
-                        st.error("Errors:"); [st.code(e) for e in pipeline_state["errors"]]
-                    val=pipeline_state.get("validation",{}); st.write(f"Validation: {val.get('score','N/A'):.2f}, Issues: {val.get('issues',[])}")
-                    if st.checkbox("Show Pipeline State"): st.json(pipeline_state, expanded=False)
-                    if pipeline_state.get("debug_images"):
-                        st.write("Debug Images:")
-                        tabs=st.tabs(list(pipeline_state["debug_images"].keys()))
-                        for i,k in enumerate(pipeline_state["debug_images"].keys()):
-                            with tabs[i]: st.image(pipeline_state["debug_images"][k],caption=k,use_column_width=True)
-            else:
-                st.error("Processing failed.")
-                if pipeline_state.get("errors"): st.error("Errors:"); [st.code(e) for e in pipeline_state["errors"]]
+        st.header("💡 Try These Queries")
+        st.markdown("""
+        **Search Examples:**
+        - Best camera phone under ₹30,000?
+        - Compact Android with good one-hand use
+        - Battery king around ₹15k
+        - Show me Samsung phones under ₹25k
+        
+        **Compare:**
+        - Compare Pixel 8a vs OnePlus 12R
+        - Compare Galaxy S23 FE, Pixel 8a, and OnePlus 12R
+        
+        **Learn:**
+        - Explain OIS vs EIS
+        - What is AMOLED display?
+        - Tell me about processors
+        
+        **Details:**
+        - Tell me more about this phone
+        (after seeing recommendations)
+        """)
+        
+        st.markdown("---")
+        st.markdown("### 🛡️ Safety Features")
+        st.markdown("""
+        - Adversarial prompt detection
+        - Toxic content filtering
+        - Irrelevant query handling
+        - Factual, neutral responses
+        """)
+        
+        if st.button("Clear Chat"):
+            st.session_state.messages = []
+            st.session_state.last_phones = []
+            st.rerun()
+    
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            
+            # Display phone cards if present
+            if "phones" in message and message["phones"]:
+                for phone in message["phones"]:
+                    display_phone_card(phone)
+    
+    # Chat input
+    if prompt := st.chat_input("Ask me about mobile phones..."):
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Process query
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                # Parse query
+                parsed_query = parse_query(prompt)
+                
+                # Handle different intents
+                if parsed_query['intent'] == QueryIntent.ADVERSARIAL:
+                    response = handle_adversarial_query(parsed_query)
+                    phones = []
+                
+                elif parsed_query['intent'] == QueryIntent.IRRELEVANT:
+                    response = handle_irrelevant_query(parsed_query)
+                    phones = []
+                
+                elif parsed_query['intent'] == QueryIntent.COMPARE:
+                    response = generate_comparison_response(parsed_query.get('phone_ids', []))
+                    phones = []
+                
+                elif parsed_query['intent'] == QueryIntent.EXPLAIN:
+                    response = generate_explanation_response(parsed_query.get('topic', ''))
+                    phones = []
+                
+                elif parsed_query['intent'] == QueryIntent.DETAILS:
+                    if st.session_state.last_phones:
+                        phone = st.session_state.last_phones[0]
+                        response = f"## {phone.brand} {phone.model} - Detailed Specs\n\n"
+                        response += f"**Price**: ₹{phone.price:,}\n\n"
+                        response += f"**Camera**: {phone.camera_mp}MP with {'OIS' if phone.has_ois else 'EIS'}\n\n"
+                        response += f"**Battery**: {phone.battery_mah}mAh with {phone.fast_charging_w}W fast charging\n\n"
+                        response += f"**Display**: {phone.screen_size}\" screen\n\n"
+                        response += f"**Processor**: {phone.processor}\n\n"
+                        response += f"**Memory**: {phone.ram_gb}GB RAM + {phone.storage_gb}GB Storage\n\n"
+                        response += f"**Weight**: {phone.weight_g}g\n\n"
+                        response += f"**Special Features**: {', '.join(phone.special_features)}\n\n"
+                        phones = [phone]
+                    else:
+                        response = "Please search for phones first, then I can provide detailed information."
+                        phones = []
+                
+                else:  # SEARCH
+                    phones = search_phones(parsed_query)
+                    response = generate_search_response(phones, parsed_query)
+                    st.session_state.last_phones = phones
+                
+                # Display response
+                st.markdown(response)
+                
+                # Display phone cards for search results
+                if phones:
+                    for phone in phones:
+                        display_phone_card(phone)
+        
+        # Add assistant message to history
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": response,
+            "phones": phones if phones else []
+        })
 
 if __name__ == "__main__":
     main()
