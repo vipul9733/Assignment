@@ -1,8 +1,1 @@
 streamlit
-opencv-python
-numpy
-mediapipe
-Pillow
-rembg
-scikit-image
-google-generativeai
